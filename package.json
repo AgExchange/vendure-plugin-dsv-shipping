@@ -1,0 +1,65 @@
+{
+  "name": "@agxchange/vendure-plugin-dsv-shipping",
+  "version": "1.0.0",
+  "description": "Vendure plugin for DSV Air, Sea, Road, and Rail shipping integration with OAuth 2.0 authentication",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build",
+    "lint": "eslint src --ext .ts",
+    "test": "jest"
+  },
+  "keywords": [
+    "vendure",
+    "vendure-plugin",
+    "shipping",
+    "dsv",
+    "freight",
+    "logistics",
+    "ecommerce",
+    "air-freight",
+    "sea-freight",
+    "road-freight",
+    "rail-freight"
+  ],
+  "author": "AgXchange",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agxchange/vendure-plugin-dsv-shipping.git"
+  },
+  "bugs": {
+    "url": "https://github.com/agxchange/vendure-plugin-dsv-shipping/issues"
+  },
+  "homepage": "https://github.com/agxchange/vendure-plugin-dsv-shipping#readme",
+  "peerDependencies": {
+    "@vendure/core": "^3.0.0",
+    "@vendure/common": "^3.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "node-cache": "^5.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/node-cache": "^4.2.5",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "@vendure/core": "^3.0.0",
+    "@vendure/common": "^3.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

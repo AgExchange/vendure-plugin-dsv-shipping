@@ -1,0 +1,451 @@
+import {
+  LanguageCode,
+  ShippingCalculator,
+  Order,
+  OrderAddress,
+  RequestContext,
+  ShippingMethod,
+  Injector,
+} from '@vendure/core';
+import NodeCache from 'node-cache';
+import {
+  DsvShippingPluginOptions,
+  DsvTransportMode,
+  DsvServiceLevel,
+  DsvQuoteRequest,
+  DsvPackage,
+  DsvAddress,
+  DsvQuoteCacheEntry,
+} from '../types';
+import { DsvApiService } from '../services/dsv-api.service';
+
+/**
+ * DSV Rate Calculator
+ * 
+ * Vendure ShippingCalculator that integrates with DSV Quote API to calculate
+ * real-time shipping rates for Air, Sea, Road, and Rail transport modes.
+ * 
+ * Features:
+ * - Real-time rate calculation via DSV API
+ * - Quote caching to reduce API calls
+ * - Support for multiple transport modes
+ * - Configurable service levels
+ * - Insurance options
+ * - Comprehensive logging for debugging
+ * 
+ * Configuration Arguments:
+ * - transportMode: Air | Sea | Road | Rail
+ * - serviceLevel: Standard | Express | Economy | FCL | LCL | Same-Day
+ * - includeInsurance: boolean
+ * - taxRate: number (percentage)
+ */
+export class DsvRateCalculator {
+  private static quoteCache: NodeCache;
+  private static pluginOptions: DsvShippingPluginOptions;
+
+  /**
+   * Initialize the calculator with plugin options
+   */
+  static init(options: DsvShippingPluginOptions): void {
+    console.info('[DSV Rate Calculator] Initializing calculator');
+    
+    this.pluginOptions = options;
+    
+    // Initialize quote cache
+    const cacheTTL = options.quoteCacheTTL || 300; // 5 minutes default
+    this.quoteCache = new NodeCache({
+      stdTTL: cacheTTL,
+      checkperiod: 60, // Check for expired keys every 60 seconds
+      useClones: false,
+    });
+
+    console.info(`[DSV Rate Calculator] Quote cache TTL: ${cacheTTL} seconds`);
+  }
+
+  /**
+   * Create the Vendure ShippingCalculator
+   */
+  static create(): ShippingCalculator {
+    return new ShippingCalculator({
+      code: 'dsv-rate-calculator',
+      description: [
+        {
+          languageCode: LanguageCode.en,
+          value: 'DSV Shipping Rate Calculator - Calculate rates for Air, Sea, Road, and Rail',
+        },
+      ],
+      args: {
+        transportMode: {
+          type: 'string',
+          ui: {
+            component: 'select-form-input',
+            options: [
+              { value: 'Air', label: [{ languageCode: LanguageCode.en, value: 'Air Freight' }] },
+              { value: 'Sea', label: [{ languageCode: LanguageCode.en, value: 'Sea Freight' }] },
+              { value: 'Road', label: [{ languageCode: LanguageCode.en, value: 'Road (EU)' }] },
+              { value: 'Rail', label: [{ languageCode: LanguageCode.en, value: 'Rail' }] },
+            ],
+          },
+          label: [
+            {
+              languageCode: LanguageCode.en,
+              value: 'Transport Mode',
+            },
+          ],
+          description: [
+            {
+              languageCode: LanguageCode.en,
+              value: 'Select the transport mode for shipping',
+            },
+          ],
+        },
+        serviceLevel: {
+          type: 'string',
+          ui: {
+            component: 'select-form-input',
+            options: [
+              { value: 'Standard', label: [{ languageCode: LanguageCode.en, value: 'Standard' }] },
+              { value: 'Express', label: [{ languageCode: LanguageCode.en, value: 'Express' }] },
+              { value: 'Economy', label: [{ languageCode: LanguageCode.en, value: 'Economy' }] },
+              { value: 'FCL', label: [{ languageCode: LanguageCode.en, value: 'FCL (Full Container)' }] },
+              { value: 'LCL', label: [{ languageCode: LanguageCode.en, value: 'LCL (Less than Container)' }] },
+              { value: 'Same-Day', label: [{ languageCode: LanguageCode.en, value: 'Same Day' }] },
+            ],
+          },
+          label: [
+            {
+              languageCode: LanguageCode.en,
+              value: 'Service Level',
+            },
+          ],
+          description: [
+            {
+              languageCode: LanguageCode.en,
+              value: 'Select the service level',
+            },
+          ],
+          defaultValue: 'Standard',
+        },
+        includeInsurance: {
+          type: 'boolean',
+          ui: {
+            component: 'boolean-form-input',
+          },
+          label: [
+            {
+              languageCode: LanguageCode.en,
+              value: 'Include Insurance',
+            },
+          ],
+          description: [
+            {
+              languageCode: LanguageCode.en,
+              value: 'Add insurance to the shipment',
+            },
+          ],
+          defaultValue: false,
+        },
+        taxRate: {
+          type: 'int',
+          ui: {
+            component: 'number-form-input',
+            suffix: '%',
+          },
+          label: [
+            {
+              languageCode: LanguageCode.en,
+              value: 'Tax Rate',
+            },
+          ],
+          description: [
+            {
+              languageCode: LanguageCode.en,
+              value: 'Tax rate percentage to apply to shipping',
+            },
+          ],
+          defaultValue: 0,
+        },
+      },
+      calculate: async (ctx, order, args, method, injector) => {
+        console.info('[DSV Rate Calculator] ======================================');
+        console.info('[DSV Rate Calculator] Calculating shipping rate');
+        console.info('[DSV Rate Calculator] Order ID:', order.id);
+        console.info('[DSV Rate Calculator] Order code:', order.code);
+        console.info('[DSV Rate Calculator] Transport mode:', args.transportMode);
+        console.info('[DSV Rate Calculator] Service level:', args.serviceLevel);
+        console.info('[DSV Rate Calculator] Include insurance:', args.includeInsurance);
+        console.info('[DSV Rate Calculator] Tax rate:', args.taxRate);
+
+        try {
+          // Validate shipping address
+          if (!order.shippingAddress) {
+            console.error('[DSV Rate Calculator] No shipping address on order');
+            throw new Error('Shipping address is required');
+          }
+
+          console.info('[DSV Rate Calculator] Shipping to:', {
+            country: order.shippingAddress.countryCode,
+            postalCode: order.shippingAddress.postalCode,
+            city: order.shippingAddress.city,
+          });
+
+          // Get API service from injector
+          const apiService = injector.get(DsvApiService);
+          if (!apiService) {
+            console.error('[DSV Rate Calculator] DsvApiService not found in injector');
+            throw new Error('DSV API Service not available');
+          }
+
+          // Build quote request
+          const quoteRequest = this.buildQuoteRequest(
+            order,
+            args.transportMode as DsvTransportMode,
+            args.serviceLevel as DsvServiceLevel,
+            args.includeInsurance
+          );
+
+          console.info('[DSV Rate Calculator] Quote request prepared');
+          console.info('[DSV Rate Calculator] Packages:', quoteRequest.packages.length);
+          console.info('[DSV Rate Calculator] Total weight:', 
+            quoteRequest.packages.reduce((sum, pkg) => sum + pkg.weight, 0), 'kg'
+          );
+
+          // Check cache first
+          const cacheKey = this.buildCacheKey(quoteRequest);
+          const cachedQuote = this.quoteCache.get<DsvQuoteCacheEntry>(cacheKey);
+
+          let quoteResponse;
+          if (cachedQuote) {
+            console.info('[DSV Rate Calculator] Using cached quote');
+            console.info('[DSV Rate Calculator] Cache age:', 
+              Math.floor((Date.now() - cachedQuote.timestamp) / 1000), 'seconds'
+            );
+            quoteResponse = cachedQuote.quote;
+          } else {
+            console.info('[DSV Rate Calculator] Requesting new quote from DSV API');
+            
+            // Request quote from DSV
+            quoteResponse = await apiService.getQuote(quoteRequest);
+
+            // Cache the quote
+            const cacheEntry: DsvQuoteCacheEntry = {
+              quote: quoteResponse,
+              timestamp: Date.now(),
+              expiresAt: Date.now() + (this.pluginOptions.quoteCacheTTL || 300) * 1000,
+            };
+            this.quoteCache.set(cacheKey, cacheEntry);
+
+            console.info('[DSV Rate Calculator] Quote cached');
+          }
+
+          // Process quote options
+          if (!quoteResponse.options || quoteResponse.options.length === 0) {
+            console.warn('[DSV Rate Calculator] No quote options available');
+            console.warn('[DSV Rate Calculator] Quote status:', quoteResponse.status);
+            throw new Error('No shipping rates available for the selected options');
+          }
+
+          console.info('[DSV Rate Calculator] Available options:', quoteResponse.options.length);
+
+          // Find best matching option based on service level
+          const selectedOption = this.selectBestOption(
+            quoteResponse.options,
+            args.serviceLevel as DsvServiceLevel
+          );
+
+          if (!selectedOption) {
+            console.warn('[DSV Rate Calculator] No matching option for service level:', args.serviceLevel);
+            throw new Error(`No rates available for ${args.serviceLevel} service`);
+          }
+
+          console.info('[DSV Rate Calculator] Selected option:');
+          console.info('  Option ID:', selectedOption.optionId);
+          console.info('  Service level:', selectedOption.serviceLevel);
+          console.info('  Price:', selectedOption.totalPrice.amount, selectedOption.totalPrice.currency);
+          console.info('  Carrier:', selectedOption.carrier || 'N/A');
+          console.info('  Transit time:', selectedOption.transitTimeDays || 'N/A', 'days');
+          console.info('  Estimated delivery:', selectedOption.estimatedDeliveryDate || 'N/A');
+
+          // Calculate final price
+          const price = selectedOption.totalPrice.amount;
+          const priceIncludesTax = ctx.channel.pricesIncludeTax;
+          const taxRate = args.taxRate || 0;
+
+          console.info('[DSV Rate Calculator] Final calculation:');
+          console.info('  Base price:', price);
+          console.info('  Tax rate:', taxRate, '%');
+          console.info('  Price includes tax:', priceIncludesTax);
+
+          // Prepare metadata for storefront
+          const metadata = {
+            dsvTransportMode: args.transportMode,
+            dsvServiceLevel: args.serviceLevel,
+            dsvQuoteId: quoteResponse.quoteRequestId,
+            dsvOptionId: selectedOption.optionId,
+            estimatedDeliveryDate: selectedOption.estimatedDeliveryDate,
+            transitTimeDays: selectedOption.transitTimeDays,
+            carrier: selectedOption.carrier,
+            currency: selectedOption.totalPrice.currency,
+            priceBreakdown: selectedOption.priceBreakdown,
+          };
+
+          console.info('[DSV Rate Calculator] Calculation complete');
+          console.info('[DSV Rate Calculator] ======================================');
+
+          return {
+            price,
+            priceIncludesTax,
+            taxRate,
+            metadata,
+          };
+
+        } catch (error: any) {
+          console.error('[DSV Rate Calculator] Error calculating shipping rate');
+          console.error('[DSV Rate Calculator] Error:', error.message);
+          console.error('[DSV Rate Calculator] Stack:', error.stack);
+          console.error('[DSV Rate Calculator] ======================================');
+
+          // Return a fallback rate or re-throw based on configuration
+          // For production, you might want to return a fallback rate instead of failing
+          throw new Error(`Failed to calculate DSV shipping rate: ${error.message}`);
+        }
+      },
+    });
+  }
+
+  /**
+   * Build quote request from order data
+   */
+  private static buildQuoteRequest(
+    order: Order,
+    transportMode: DsvTransportMode,
+    serviceLevel: DsvServiceLevel,
+    includeInsurance: boolean
+  ): DsvQuoteRequest {
+    console.info('[DSV Rate Calculator] Building quote request');
+
+    // Convert shipping address to DSV format
+    const destination = this.convertAddress(order.shippingAddress!);
+    
+    // Use a default origin (should be configured based on warehouse location)
+    // TODO: Make this configurable
+    const origin = {
+      countryCode: 'ZA', // South Africa - adjust based on your warehouse
+      postalCode: '0001',
+      city: 'Pretoria',
+    };
+
+    console.info('[DSV Rate Calculator] Origin:', origin);
+    console.info('[DSV Rate Calculator] Destination:', destination);
+
+    // Calculate packages from order lines
+    const packages = this.calculatePackages(order);
+
+    return {
+      transportMode,
+      origin,
+      destination,
+      packages,
+      serviceLevel,
+      includeInsurance,
+      customerReference: order.code,
+    };
+  }
+
+  /**
+   * Convert Vendure OrderAddress to DSV Address format
+   */
+  private static convertAddress(address: OrderAddress): {
+    countryCode: string;
+    postalCode?: string;
+    city?: string;
+  } {
+    return {
+      countryCode: address.countryCode || '',
+      postalCode: address.postalCode || undefined,
+      city: address.city || undefined,
+    };
+  }
+
+  /**
+   * Calculate packages from order lines
+   * 
+   * ASSUMPTION: Product weight is stored in customFields.weight (in kg)
+   * If not present, uses default weight of 1kg per item
+   */
+  private static calculatePackages(order: Order): DsvPackage[] {
+    console.info('[DSV Rate Calculator] Calculating packages from order lines');
+    console.info('[DSV Rate Calculator] Order lines:', order.lines.length);
+
+    // Group items into packages
+    // Simple approach: one package containing all items
+    // TODO: Implement smarter packaging logic based on dimensions
+    
+    let totalWeight = 0;
+    let totalValue = 0;
+
+    order.lines.forEach((line) => {
+      // Get weight from custom field or use default
+      const itemWeight = (line.productVariant.customFields as any)?.weight || 1;
+      const lineWeight = itemWeight * line.quantity;
+      
+      totalWeight += lineWeight;
+      totalValue += line.proratedLinePrice;
+
+      console.info(`[DSV Rate Calculator] Line: ${line.productVariant.name}`);
+      console.info(`  Quantity: ${line.quantity}`);
+      console.info(`  Weight per item: ${itemWeight} kg`);
+      console.info(`  Total line weight: ${lineWeight} kg`);
+    });
+
+    console.info('[DSV Rate Calculator] Total weight:', totalWeight, 'kg');
+    console.info('[DSV Rate Calculator] Total value:', totalValue);
+
+    return [
+      {
+        quantity: 1,
+        packageType: 'Box',
+        weight: totalWeight,
+        description: `Order ${order.code}`,
+        value: totalValue,
+        currency: order.currencyCode,
+      },
+    ];
+  }
+
+  /**
+   * Select best matching option from quote response
+   */
+  private static selectBestOption(
+    options: any[],
+    preferredServiceLevel: DsvServiceLevel
+  ): any {
+    console.info('[DSV Rate Calculator] Selecting best option');
+    console.info('[DSV Rate Calculator] Preferred service level:', preferredServiceLevel);
+
+    // First, try to find exact match
+    const exactMatch = options.find(
+      (opt) => opt.serviceLevel === preferredServiceLevel
+    );
+
+    if (exactMatch) {
+      console.info('[DSV Rate Calculator] Found exact match for service level');
+      return exactMatch;
+    }
+
+    // If no exact match, return cheapest option
+    console.info('[DSV Rate Calculator] No exact match, selecting cheapest option');
+    
+    return options.reduce((cheapest, current) => {
+      if (!cheapest) return current;
+      return current.totalPrice.amount < cheapest.totalPrice.amount ? current : cheapest;
+    }, null);
+  }
+
+  /**
+   * Build cache key from quote request
+   */
+  private static buildCacheKey(request: DsvQuoteRequest): string {
+    return `quote:${request.transportMode}:${request.origin.countryCode}:${request.destination.countryCode}:${request.packages[0]?.weight || 0}`;
+  }
+}
