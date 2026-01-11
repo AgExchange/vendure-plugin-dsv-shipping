@@ -1,281 +1,297 @@
+/**
+ * DSV Authentication Service
+ * 
+ * Handles OAuth 2.0 authentication with DSV API
+ * - Token acquisition
+ * - Automatic token refresh (5 minutes before expiry)
+ * - Token caching
+ */
+
 import { Injectable } from '@nestjs/common';
 import axios, { AxiosInstance } from 'axios';
-import { DsvTokenRequest, DsvTokenResponse, DsvShippingPluginOptions } from '../types';
+import {
+    DsvShippingPluginOptions,
+    DsvTokenResponse,
+    CachedToken,
+} from '../types/plugin-options.types';
 
-/**
- * DSV OAuth 2.0 Authentication Service
- * 
- * Handles authentication with DSV APIs using OAuth 2.0.
- * According to DSV documentation, all Generic APIs require:
- * - Bearer token in Authorization header
- * - DSV-Subscription-Key in header
- * 
- * Token Management:
- * - Automatically refreshes tokens before expiration
- * - Caches valid tokens to minimize API calls
- * - Handles token expiration with 5-minute buffer
- */
 @Injectable()
 export class DsvAuthService {
-  private accessToken: string | null = null;
-  private tokenExpiresAt: number | null = null;
-  private readonly axiosInstance: AxiosInstance;
-  private readonly baseUrl: string;
-  private readonly tokenBufferSeconds = 300; // Refresh 5 minutes before expiry
-
-  constructor(private readonly options: DsvShippingPluginOptions) {
-    console.info('[DSV Auth Service] Initializing authentication service');
+    private options!: DsvShippingPluginOptions;
+    private axiosInstance: AxiosInstance;
+    private baseUrl: string = '';
+    private accessToken: CachedToken | null = null;
+    private tokenBufferSeconds = 60; // Refresh 1 minute before expiry (tokens last ~10 min)
     
-    // Set base URL based on environment
-    this.baseUrl = options.environment === 'production' 
-      ? 'https://api.dsv.com' 
-      : 'https://api-uat.dsv.com';
-
-    console.info(`[DSV Auth Service] Environment: ${options.environment}`);
-    console.info(`[DSV Auth Service] Base URL: ${this.baseUrl}`);
-
-    // Create axios instance for token requests
-    this.axiosInstance = axios.create({
-      baseURL: this.baseUrl,
-      timeout: 30000, // 30 second timeout
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-      },
-    });
-
-    // Add request interceptor for debugging
-    if (options.debugMode) {
-      this.axiosInstance.interceptors.request.use(
-        (config) => {
-          console.info('[DSV Auth Service] Request:', {
-            method: config.method?.toUpperCase(),
-            url: config.url,
-            headers: this.sanitizeHeaders(config.headers),
-          });
-          return config;
-        },
-        (error) => {
-          console.error('[DSV Auth Service] Request error:', error.message);
-          return Promise.reject(error);
-        }
-      );
+    constructor() {
+        // Basic axios instance - will be configured in init()
+        this.axiosInstance = axios.create({
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Accept': 'application/json',
+            },
+            timeout: 30000,
+        });
     }
-
-    // Add response interceptor for debugging
-    if (options.debugMode) {
-      this.axiosInstance.interceptors.response.use(
-        (response) => {
-          console.info('[DSV Auth Service] Response:', {
-            status: response.status,
-            statusText: response.statusText,
-            data: this.sanitizeResponseData(response.data),
-          });
-          return response;
-        },
-        (error) => {
-          console.error('[DSV Auth Service] Response error:', {
-            status: error.response?.status,
-            statusText: error.response?.statusText,
-            data: error.response?.data,
-          });
-          return Promise.reject(error);
-        }
-      );
-    }
-  }
-
-  /**
-   * Get a valid access token
-   * Automatically refreshes if token is expired or about to expire
-   */
-  async getAccessToken(): Promise<string> {
-    console.info('[DSV Auth Service] Getting access token');
-
-    // Check if we have a valid cached token
-    if (this.isTokenValid()) {
-      const remainingTime = this.tokenExpiresAt ? Math.floor((this.tokenExpiresAt - Date.now()) / 1000) : 0;
-      console.info(`[DSV Auth Service] Using cached token (expires in ${remainingTime}s)`);
-      return this.accessToken!;
-    }
-
-    console.info('[DSV Auth Service] Token expired or not available, requesting new token');
     
-    // Request new token
-    await this.refreshToken();
-    
-    if (!this.accessToken) {
-      throw new Error('Failed to obtain access token');
-    }
-
-    return this.accessToken;
-  }
-
-  /**
-   * Force refresh the access token
-   */
-  async refreshToken(): Promise<void> {
-    console.info('[DSV Auth Service] Refreshing access token');
-    console.info(`[DSV Auth Service] Client email: ${this.options.clientEmail}`);
-
-    try {
-      // Prepare token request according to OAuth 2.0 password grant
-      const tokenRequest: DsvTokenRequest = {
-        grant_type: 'password',
-        username: this.options.clientEmail,
-        password: this.options.clientPassword,
-      };
-
-      // Convert to URL-encoded format
-      const urlEncodedData = new URLSearchParams({
-        grant_type: tokenRequest.grant_type,
-        username: tokenRequest.username,
-        password: tokenRequest.password,
-      }).toString();
-
-      console.info('[DSV Auth Service] Sending token request to /oauth/v1/Token');
-
-      // Request token from DSV OAuth endpoint
-      const response = await this.axiosInstance.post<DsvTokenResponse>(
-        '/oauth/v1/Token',
-        urlEncodedData,
-        {
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-        }
-      );
-
-      console.info('[DSV Auth Service] Token request successful');
-
-      // Extract token data
-      const tokenData = response.data;
-      
-      if (!tokenData.access_token) {
-        console.error('[DSV Auth Service] No access_token in response:', tokenData);
-        throw new Error('Invalid token response: missing access_token');
-      }
-
-      // Store token and calculate expiration time
-      this.accessToken = tokenData.access_token;
-      const expiresIn = tokenData.expires_in || 3600; // Default to 1 hour if not specified
-      
-      // Calculate expiration with buffer
-      const expirationTime = Date.now() + (expiresIn - this.tokenBufferSeconds) * 1000;
-      this.tokenExpiresAt = expirationTime;
-
-      const expiresInMinutes = Math.floor(expiresIn / 60);
-      console.info(`[DSV Auth Service] Token obtained successfully`);
-      console.info(`[DSV Auth Service] Token type: ${tokenData.token_type}`);
-      console.info(`[DSV Auth Service] Expires in: ${expiresInMinutes} minutes`);
-      console.info(`[DSV Auth Service] Token will be refreshed ${this.tokenBufferSeconds / 60} minutes before expiry`);
-
-    } catch (error: any) {
-      console.error('[DSV Auth Service] Failed to obtain access token');
-      
-      if (axios.isAxiosError(error)) {
-        console.error('[DSV Auth Service] HTTP Status:', error.response?.status);
-        console.error('[DSV Auth Service] Response data:', error.response?.data);
+    /**
+     * Initialize service with plugin options
+     * Called from calculator/handler init()
+     */
+    init(options: DsvShippingPluginOptions): void {
+        this.options = options;
+        this.baseUrl = options.auth.apiBaseUrl;
         
-        // Provide helpful error messages based on status code
-        if (error.response?.status === 401) {
-          console.error('[DSV Auth Service] Authentication failed - check credentials');
-          console.error('[DSV Auth Service] Verify DSV_CLIENT_EMAIL and DSV_CLIENT_PASSWORD');
-          throw new Error('DSV Authentication failed: Invalid credentials');
-        } else if (error.response?.status === 403) {
-          console.error('[DSV Auth Service] Access forbidden - check subscription status');
-          throw new Error('DSV Authentication failed: Access forbidden');
-        } else if (error.response?.status === 429) {
-          console.error('[DSV Auth Service] Rate limit exceeded');
-          throw new Error('DSV Authentication failed: Rate limit exceeded');
+        this.axiosInstance.defaults.baseURL = this.baseUrl;
+        
+        this.log('info', 'DSV Auth Service initialized', {
+            apiBaseUrl: options.auth.apiBaseUrl,
+            tokenEndpoint: options.auth.tokenEndpoint,
+        });
+    }
+    
+    /**
+     * Get valid access token
+     * Tries to refresh using refresh_token first, falls back to new token
+     */
+    async getAccessToken(): Promise<string> {
+        // Check if we have a valid cached token
+        if (this.accessToken && this.isTokenValid(this.accessToken)) {
+            this.log('debug', 'Using cached access token');
+            return this.accessToken.token;
         }
-      }
-
-      console.error('[DSV Auth Service] Error details:', error.message);
-      throw new Error(`DSV Authentication failed: ${error.message}`);
+        
+        // Try to refresh with refresh token if we have one
+        if (this.accessToken?.refreshToken && this.isRefreshTokenValid(this.accessToken)) {
+            this.log('info', 'Refreshing access token using refresh_token');
+            try {
+                return await this.refreshToken(this.accessToken.refreshToken);
+            } catch (error) {
+                this.log('info', 'Refresh token failed, acquiring new token', {
+                    error: this.formatError(error),
+                });
+            }
+        }
+        
+        // Acquire new token with client_credentials
+        this.log('info', 'Acquiring new access token with client_credentials');
+        return await this.acquireToken();
     }
-  }
-
-  /**
-   * Check if current token is valid
-   * Token is considered valid if it exists and hasn't expired (with buffer)
-   */
-  private isTokenValid(): boolean {
-    if (!this.accessToken || !this.tokenExpiresAt) {
-      console.info('[DSV Auth Service] No token cached');
-      return false;
-    }
-
-    const now = Date.now();
-    const isValid = now < this.tokenExpiresAt;
     
-    if (!isValid) {
-      const expiredSeconds = Math.floor((now - this.tokenExpiresAt) / 1000);
-      console.info(`[DSV Auth Service] Token expired ${expiredSeconds}s ago`);
+    /**
+     * Check if refresh token is still valid
+     */
+    private isRefreshTokenValid(cachedToken: CachedToken): boolean {
+        if (!cachedToken.refreshExpiresAt) {
+            return false;
+        }
+        const now = new Date();
+        return now < cachedToken.refreshExpiresAt;
     }
-
-    return isValid;
-  }
-
-  /**
-   * Clear cached token (useful for testing or manual refresh)
-   */
-  clearToken(): void {
-    console.info('[DSV Auth Service] Clearing cached token');
-    this.accessToken = null;
-    this.tokenExpiresAt = null;
-  }
-
-  /**
-   * Get token info (for debugging)
-   */
-  getTokenInfo(): {
-    hasToken: boolean;
-    expiresAt: number | null;
-    expiresInSeconds: number | null;
-  } {
-    const expiresInSeconds = this.tokenExpiresAt 
-      ? Math.floor((this.tokenExpiresAt - Date.now()) / 1000)
-      : null;
-
-    return {
-      hasToken: !!this.accessToken,
-      expiresAt: this.tokenExpiresAt,
-      expiresInSeconds,
-    };
-  }
-
-  /**
-   * Sanitize headers for logging (hide sensitive data)
-   */
-  private sanitizeHeaders(headers: any): any {
-    if (!headers) return headers;
-
-    const sanitized = { ...headers };
     
-    if (sanitized.Authorization) {
-      sanitized.Authorization = 'Bearer ***';
+    /**
+     * Check if cached token is still valid
+     */
+    private isTokenValid(cachedToken: CachedToken): boolean {
+        const now = new Date();
+        const expiresWithBuffer = new Date(
+            cachedToken.expiresAt.getTime() - (this.tokenBufferSeconds * 1000)
+        );
+        return now < expiresWithBuffer;
     }
-
-    return sanitized;
-  }
-
-  /**
-   * Sanitize response data for logging (hide sensitive tokens)
-   */
-  private sanitizeResponseData(data: any): any {
-    if (!data) return data;
-
-    const sanitized = { ...data };
-
-    if (sanitized.access_token) {
-      sanitized.access_token = `${sanitized.access_token.substring(0, 10)}...`;
+    
+    /**
+     * Acquire new access token from DSV OAuth endpoint
+     */
+    private async acquireToken(): Promise<string> {
+        try {
+            const params = new URLSearchParams({
+                grant_type: 'client_credentials',
+                client_id: this.options.auth.clientEmail,
+                client_secret: this.options.auth.clientPassword,
+            });
+            
+            const fullUrl = `${this.baseUrl}${this.options.auth.tokenEndpoint}`;
+            
+            this.log('info', 'Requesting token from DSV', {
+                url: fullUrl,
+                client_id: this.options.auth.clientEmail,
+                grant_type: 'client_credentials',
+            });
+            
+            if (this.options.debugMode) {
+                console.info('[DSV Auth Service] Request details:', {
+                    method: 'POST',
+                    url: fullUrl,
+                    body: params.toString(),
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'DSV-Subscription-Key': this.options.auth.accessTokenKey ? '***' + this.options.auth.accessTokenKey.slice(-4) : 'MISSING',
+                    },
+                });
+            }
+            
+            const response = await this.axiosInstance.post<DsvTokenResponse>(
+                this.options.auth.tokenEndpoint,
+                params.toString(),
+                {
+                    headers: {
+                        'DSV-Subscription-Key': this.options.auth.accessTokenKey,
+                    },
+                }
+            );
+            
+            const tokenData = response.data;
+            
+            // Calculate expiry times
+            const expiresAt = new Date();
+            expiresAt.setSeconds(expiresAt.getSeconds() + tokenData.expires_in);
+            
+            const refreshExpiresAt = tokenData.refresh_expires_in 
+                ? new Date(Date.now() + (tokenData.refresh_expires_in * 1000))
+                : undefined;
+            
+            // Cache token with refresh token
+            this.accessToken = {
+                token: tokenData.access_token,
+                expiresAt,
+                refreshToken: tokenData.refresh_token,
+                refreshExpiresAt,
+            };
+            
+            this.log('info', 'Access token acquired successfully', {
+                expiresAt: expiresAt.toISOString(),
+                expiresIn: tokenData.expires_in,
+                hasRefreshToken: !!tokenData.refresh_token,
+                refreshExpiresIn: tokenData.refresh_expires_in,
+            });
+            
+            return tokenData.access_token;
+            
+        } catch (error) {
+            this.log('error', 'Failed to acquire access token', {
+                error: this.formatError(error),
+            });
+            throw new Error(`DSV OAuth authentication failed: ${this.formatError(error)}`);
+        }
     }
-
-    if (sanitized.refresh_token) {
-      sanitized.refresh_token = `${sanitized.refresh_token.substring(0, 10)}...`;
+    
+    /**
+     * Refresh access token using refresh_token
+     */
+    private async refreshToken(refreshToken: string): Promise<string> {
+        try {
+            const params = new URLSearchParams({
+                grant_type: 'refresh_token',
+                refresh_token: refreshToken,
+            });
+            
+            this.log('debug', 'Refreshing token with refresh_token', {
+                url: `${this.baseUrl}${this.options.auth.tokenEndpoint}`,
+            });
+            
+            const response = await this.axiosInstance.post<DsvTokenResponse>(
+                this.options.auth.tokenEndpoint,
+                params.toString(),
+                {
+                    headers: {
+                        'DSV-Subscription-Key': this.options.auth.accessTokenKey,
+                    },
+                }
+            );
+            
+            const tokenData = response.data;
+            
+            // Calculate expiry times
+            const expiresAt = new Date();
+            expiresAt.setSeconds(expiresAt.getSeconds() + tokenData.expires_in);
+            
+            const refreshExpiresAt = tokenData.refresh_expires_in 
+                ? new Date(Date.now() + (tokenData.refresh_expires_in * 1000))
+                : undefined;
+            
+            // Cache refreshed token
+            this.accessToken = {
+                token: tokenData.access_token,
+                expiresAt,
+                refreshToken: tokenData.refresh_token || refreshToken, // Use new or keep old
+                refreshExpiresAt,
+            };
+            
+            this.log('info', 'Access token refreshed successfully', {
+                expiresAt: expiresAt.toISOString(),
+                expiresIn: tokenData.expires_in,
+            });
+            
+            return tokenData.access_token;
+            
+        } catch (error) {
+            this.log('error', 'Failed to refresh access token', {
+                error: this.formatError(error),
+            });
+            throw error; // Let caller handle fallback
+        }
     }
-
-    return sanitized;
-  }
+    
+    /**
+     * Format error for logging
+     */
+    private formatError(error: any): string {
+        if (axios.isAxiosError(error)) {
+            const status = error.response?.status || 'NO_STATUS';
+            const statusText = error.response?.statusText || 'NO_STATUS_TEXT';
+            const data = error.response?.data;
+            const url = error.config?.url || 'NO_URL';
+            
+            let errorMsg = `${status} ${statusText} (${url})`;
+            
+            if (data) {
+                if (typeof data === 'string') {
+                    errorMsg += ` - ${data}`;
+                } else if (data.error) {
+                    errorMsg += ` - ${data.error}`;
+                } else if (data.message) {
+                    errorMsg += ` - ${data.message}`;
+                } else {
+                    errorMsg += ` - ${JSON.stringify(data)}`;
+                }
+            }
+            
+            // Log full error details for debugging
+            if (this.options?.debugMode) {
+                console.error('[DSV Auth Service] Full error details:', {
+                    url,
+                    status,
+                    statusText,
+                    data,
+                    headers: error.response?.headers,
+                    requestHeaders: error.config?.headers,
+                });
+            }
+            
+            return errorMsg;
+        }
+        
+        if (error instanceof Error) {
+            return error.message;
+        }
+        
+        return String(error);
+    }
+    
+    /**
+     * Logging helper
+     */
+    private log(level: 'debug' | 'info' | 'error', message: string, data?: any): void {
+        const prefix = '[DSV Auth Service]';
+        const timestamp = new Date().toISOString();
+        
+        // Only log debug messages if debug mode enabled
+        if (level === 'debug' && !this.options?.debugMode) {
+            return;
+        }
+        
+        const logData = data ? ` ${JSON.stringify(data)}` : '';
+        console.log(`${timestamp} ${prefix} ${message}${logData}`);
+    }
 }
