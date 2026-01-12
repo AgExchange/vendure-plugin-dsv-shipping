@@ -50,7 +50,7 @@ export function convertVendureContact(
     customer: Customer | undefined | null,
     order?: Order
 ): DsvBookingContact {
-    console.info('[DSV Converter v0.4.6] convertVendureContact called', {
+    console.info('[DSV Converter] convertVendureContact called', {
         hasCustomer: !!customer,
         hasOrder: !!order,
         hasOrderCustomer: !!order?.customer,
@@ -61,7 +61,7 @@ export function convertVendureContact(
     
     // Handle completely missing customer - try shipping address first
     if (!customer && !order?.customer) {
-        console.info('[DSV Converter v0.4.6] No customer object - checking shipping address');
+        console.info('[DSV Converter] No customer object - checking shipping address');
         
         // Try to extract from shipping address
         if (order?.shippingAddress) {
@@ -70,7 +70,7 @@ export function convertVendureContact(
             const email = 'noreply@example.com'; // Address doesn't have email
             const telephone = addr.phoneNumber || '+27000000000';
             
-            console.info('[DSV Converter v0.4.6] Using shipping address data', {
+            console.info('[DSV Converter] Using shipping address data', {
                 name,
                 telephone,
             });
@@ -83,7 +83,7 @@ export function convertVendureContact(
         }
         
         // Last resort fallback
-        console.info('[DSV Converter v0.4.6] No customer or address data - using fallback');
+        console.info('[DSV Converter] No customer or address data - using fallback');
         return {
             name: 'Customer',
             email: 'noreply@example.com',
@@ -94,7 +94,7 @@ export function convertVendureContact(
     // Use provided customer or fallback to order.customer
     const cust = customer || order?.customer;
     
-    console.info('[DSV Converter v0.4.6] Using customer object', {
+    console.info('[DSV Converter] Using customer object', {
         hasCust: !!cust,
         custType: typeof cust,
         hasFirstName: cust ? 'firstName' in cust : false,
@@ -105,14 +105,20 @@ export function convertVendureContact(
     const lastName = cust?.lastName || '';
     const email = cust?.emailAddress || 'noreply@example.com';
     const phone = cust?.phoneNumber || '+27000000000';
-    
+    // Get organization name - try multiple sources
+    const organizationName = 
+        order?.shippingAddress?.company ||           // Shipping address company
+        (cust as any)?.customFields?.companyName ||  // Customer company field
+        'Private Customer';                          // Fallback
+
     const result = {
+        organizationName,  // ADDED - required by DSV API
         name: `${firstName} ${lastName}`.trim() || 'Customer',
         email,
         telephone: phone,
     };
     
-    console.info('[DSV Converter v0.4.6] Returning contact', result);
+    console.info('[DSV Converter] Returning contact', result);
     
     return result;
 }

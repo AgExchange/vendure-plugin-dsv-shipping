@@ -2,7 +2,6 @@
  * DSV Shipping Plugin - Main Entry Point
  * 
  * Vendure 3.x plugin for DSV shipping integration
- * Phase 1: OAuth + Quote API for real-time shipping rates
  */
 
 import { PluginCommonModule, VendurePlugin } from '@vendure/core';
@@ -12,6 +11,8 @@ import { DsvQuoteService } from './services/dsv-quote.service';
 import { DsvBookingService } from './services/dsv-booking.service';
 import { dsvRateCalculator, initDsvCalculator } from './calculators/dsv-rate.calculator';
 import { dsvFulfillmentHandler, initDsvHandler } from './handlers/dsv-fulfillment.handler';
+import { dsvEligibilityChecker } from './calculators/dsv-eligibility.checker';
+
 
 /**
  * Validate plugin options
@@ -259,6 +260,9 @@ function validateOptions(options: DsvShippingPluginOptions): void {
             dsvFulfillmentHandler,
         ];
         console.info('[DSV Plugin] Registered DSV Fulfillment Handler');
+
+        // Add eligibility checker
+        config.shippingOptions.shippingEligibilityCheckers.push(dsvEligibilityChecker);
         
         return config;
     },
